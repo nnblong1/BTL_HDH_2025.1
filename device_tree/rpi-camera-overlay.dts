@@ -1,0 +1,16 @@
+/dts-v1/;
+/plugin/;
+
+/ {
+    compatible = "brcm,bcm2835";
+
+    fragment@0 {
+        target-path = "/";
+        __overlay__ {
+            camera:  rpi_camera@0 {
+                compatible = "rpi_camera_driver";
+                status = "okay";
+            };
+        };
+    };
+};
