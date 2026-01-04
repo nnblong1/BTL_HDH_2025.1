@@ -140,9 +140,15 @@ static void stop_streaming(struct vb2_queue *q)
     pr_info("Camera streaming stopped\n");
 }
 static const struct vb2_ops camera_vb2_ops = {
+    .queue_setup     = camera_queue_setup,
+    .buf_prepare     = camera_buf_prepare,
+    .buf_queue       = camera_buf_queue,
     .start_streaming = start_streaming,
-    .stop_streaming = stop_streaming,
+    .stop_streaming  = stop_streaming,
+    .wait_prepare    = vb2_ops_wait_prepare,
+    .wait_finish     = vb2_ops_wait_finish,
 };
+
 /* Probe function */
 static int camera_probe(struct platform_device *pdev)
 {
@@ -179,13 +185,27 @@ static int camera_probe(struct platform_device *pdev)
     if (ret)
         goto err_free_i2c;
 
-    vdev = &cam->vdev;
-    vdev->v4l2_dev = v4l2_dev;
-    vdev->fops = &camera_fops;
+strscpy(vdev->name, DRIVER_NAME, sizeof(vdev->name));
+vdev->v4l2_dev = v4l2_dev;
+vdev->fops = &camera_fops;
+vdev->ioctl_ops = camera_get_ioctl_ops();
+vdev->release = video_device_release_empty;
+vdev->device_caps = V4L2_CAP_VIDEO_CAPTURE | V4L2_CAP_STREAMING;
+vdev->lock = &cam->lock;   // nếu có mutex
+
 
     ret = video_register_device(vdev, VFL_TYPE_VIDEO, -1);
     if (ret)
         goto err_unregister_v4l2;
+        ret = camera_queue_init(cam);
+    if (ret)
+        goto err_unregister_v4l2;
+
+    // Cấu hình video_device
+vdev->queue = &cam->queue.vb2_q;
+vdev->ioctl_ops = camera_get_ioctl_ops();
+vdev->release = video_device_release_empty;
+vdev->device_caps = V4L2_CAP_VIDEO_CAPTURE | V4L2_CAP_STREAMING;
 
     pr_info("Camera probed successfully\n");
     return 0;
@@ -205,6 +225,19 @@ static struct platform_driver camera_driver = {
         .name = DRIVER_NAME,
     },
 };
+static int __init camera_init(void)
+{
+    camera_pdev = platform_device_register_simple(DRIVER_NAME, -1, NULL, 0);
+    return platform_driver_register(&camera_driver);
+}
 
+static void __exit camera_exit(void)
+{
+    platform_driver_unregister(&camera_driver);
+    platform_device_unregister(camera_pdev);
+}
+
+module_init(camera_init);
+module_exit(camera_exit);
 module_platform_driver(camera_driver);
 MODULE_LICENSE("GPL");
