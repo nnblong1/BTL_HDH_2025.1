@@ -75,7 +75,7 @@ struct unicam_device {
 	dev_t devt;
 	struct cdev cdev;
 	struct class *class;
-	
+	struct device *char_dev; 
 	/* Status Flags */
 	bool streaming;
 	bool initialized;
@@ -483,6 +483,7 @@ static const struct file_operations unicam_fops = {
 static int unicam_probe(struct platform_device *pdev)
 {
 	struct unicam_device *dev;
+	struct device *char_dev;
 	struct resource *res;
 	struct device_node *i2c_node;
 	struct i2c_adapter *adapter;
@@ -652,7 +653,73 @@ static int unicam_probe(struct platform_device *pdev)
 		ret = -ENOMEM;
 		goto err_class;
 	}
+	dev_info(&pdev->dev, "Creating character device interface\n");
 	
+	/* Bước 1: Cấp phát dynamic device number
+	 * - major number: tự động (0)
+	 * - minor number: bắt đầu từ 0
+	 * - count: 1 device
+	 */
+	ret = alloc_chrdev_region(&dev->devt, 0, 1, DEVICE_NAME);
+	if (ret < 0) {
+		dev_err(&pdev->dev, "Failed to allocate char device region: %d\n", ret);
+		goto err_i2c;
+	}
+	
+	dev_info(&pdev->dev, "Allocated device number: MAJOR=%d, MINOR=%d\n",
+		 MAJOR(dev->devt), MINOR(dev->devt));
+	
+	/* Bước 2: Khởi tạo cdev structure
+	 * Liên kết file_operations với cdev
+	 */
+	cdev_init(&dev->cdev, &unicam_fops);
+	dev->cdev.owner = THIS_MODULE;
+	dev->cdev.ops = &unicam_fops; /* Explicitly set operations */
+	
+	/* Bước 3: Đăng ký cdev với kernel
+	 * Sau bước này, device có thể được access qua dev_t
+	 */
+	ret = cdev_add(&dev->cdev, dev->devt, 1);
+	if (ret < 0) {
+		dev_err(&pdev->dev, "Failed to add char device: %d\n", ret);
+		goto err_chrdev_region;
+	}
+	
+	dev_info(&pdev->dev, "Character device added to kernel\n");
+	
+	/* Bước 4: Tạo device class
+	 * Class sẽ xuất hiện trong /sys/class/
+	 * Sử dụng class_create() thay vì class_create(THIS_MODULE, name)
+	 * cho kernel version >= 6.4
+	 */
+	dev->class = class_create(DRIVER_NAME);
+	if (IS_ERR(dev->class)) {
+		ret = PTR_ERR(dev->class);
+		dev_err(&pdev->dev, "Failed to create device class: %d\n", ret);
+		goto err_cdev;
+	}
+	
+	dev_info(&pdev->dev, "Device class created: /sys/class/%s\n", DRIVER_NAME);
+	
+	/* Bước 5: Tạo device node
+	 * - Tự động tạo /dev/unicam0 qua udev
+	 * - Xuất hiện trong /sys/class/manual-unicam/unicam0
+	 * - device_create() trả về struct device*
+	 */
+	char_dev = device_create(dev->class, &pdev->dev, dev->devt,
+				 dev, DEVICE_NAME);
+	if (IS_ERR(char_dev)) {
+		ret = PTR_ERR(char_dev);
+		dev_err(&pdev->dev, "Failed to create device node: %d\n", ret);
+		goto err_class;
+	}
+	
+	/* Store char device pointer for later use (optional) */
+	dev->char_dev = char_dev;
+	
+	dev_info(&pdev->dev, "Device node created: /dev/%s\n", DEVICE_NAME);
+	dev_info(&pdev->dev, "Device permissions: crw-rw---- (660)\n");
+	dev_info(&pdev->dev, "Character device registration complete\n");
 	dev->initialized = true;
 	
 	dev_info(&pdev->dev, "Manual Unicam driver initialized successfully\n");
@@ -675,17 +742,18 @@ err_dma:
 err_clocks:
 	clk_disable_unprepare(dev->clock_vpu);
 	clk_disable_unprepare(dev->clock_lp);
-	
+err_chrdev_region:
+	unregister_chrdev_region(dev->devt, 1);	
 	return ret;
 }
 
 /*
- * Platform Driver Remove
+ * Platform Driver Removeal
  */
 static void unicam_remove(struct platform_device *pdev)
 {
 	struct unicam_device *dev = platform_get_drvdata(pdev);
-	
+
 	dev_info(&pdev->dev, "Removing manual Unicam driver\n");
 	
 	/* Stop streaming if active */
@@ -694,11 +762,25 @@ static void unicam_remove(struct platform_device *pdev)
 		unicam_hw_disable(dev);
 	}
 	
-	/* Cleanup device */
-	device_destroy(dev->class, dev->devt);
-	class_destroy(dev->class);
+	/* 1. Xóa device node (/dev/unicam0) */
+	if (dev->class && dev->devt) {
+		device_destroy(dev->class, dev->devt);
+		dev_info(&pdev->dev, "Device node /dev/%s destroyed\n", DEVICE_NAME);
+	}
+	
+	/* 2. Xóa device class (/sys/class/manual-unicam) */
+	if (dev->class) {
+		class_destroy(dev->class);
+		dev_info(&pdev->dev, "Device class destroyed\n");
+	}
+	
+	/* 3. Xóa cdev khỏi kernel */
 	cdev_del(&dev->cdev);
+	dev_info(&pdev->dev, "Character device removed from kernel\n");
+	
+	/* 4. Giải phóng device number */
 	unregister_chrdev_region(dev->devt, 1);
+	dev_info(&pdev->dev, "Device number unregistered\n");
 	
 	/* Cleanup I2C */
 	i2c_unregister_device(dev->sensor_client);
@@ -720,7 +802,7 @@ static void unicam_remove(struct platform_device *pdev)
  * Device Tree Matching
  */
 static const struct of_device_id unicam_of_match[] = {
-	{ .compatible = "vendor,manual-unicam" },
+	{ .compatible = "bcm,bcm2835-unicam" },
 	{ }
 };
 MODULE_DEVICE_TABLE(of, unicam_of_match);
